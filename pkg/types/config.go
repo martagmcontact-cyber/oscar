@@ -267,6 +267,14 @@ type Config struct {
 
 	// KserveEnable option to enable KServe integration to deploy services using KServe InferenceService CRD
 	KserveEnable bool `json:"-"`
+
+	// VpaEnable option to enable native VerticalPodAutoscaler support for exposed services
+	VpaEnable bool `json:"-"`
+
+	// KedaEnable option to enable native KEDA (ScaledObject) support for exposed services.
+	// Mutually exclusive with the native HorizontalPodAutoscaler for the same service.
+	KedaEnable bool `json:"-"`
+
 	// PrometheusBaseURL base URL for Prometheus HTTP API
 	PrometheusBaseURL string `json:"-"`
 
@@ -373,6 +381,8 @@ var configVars = []configVar{
 	{"TTLJob", "TTL_JOB", false, intType, "2592000"},
 	{"JobListingLimit", "JOB_LISTING_LIMIT", false, intType, "70"},
 	{"KserveEnable", "KSERVE_ENABLE", false, boolType, "false"},
+	{"VpaEnable", "VPA_ENABLE", false, boolType, "false"},
+	{"KedaEnable", "KEDA_ENABLE", false, boolType, "false"},
 	{"PrometheusBaseURL", "PROMETHEUS_URL", false, urlType, ""},
 	{"PrometheusCPUQuery", "PROMETHEUS_CPU_QUERY", false, stringType, "sum(increase(container_cpu_usage_seconds_total{namespace=~\"{{services_namespace}}.*\",service=~\"{{service}}\"}[{{range}}])) / 3600"},
 	{"PrometheusGPUQuery", "PROMETHEUS_GPU_QUERY", false, stringType, "sum(increase(container_gpu_usage_seconds_total{namespace=~\"{{services_namespace}}.*\",service=~\"{{service}}\"}[{{range}}])) / 3600"},

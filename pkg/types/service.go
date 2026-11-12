@@ -479,17 +479,38 @@ type ServiceVolumeStatus struct {
 }
 
 type Expose struct {
-	MinScale       int32   `json:"min_scale" default:"1"`
-	MaxScale       int32   `json:"max_scale" default:"10"`
-	APIPort        []int   `json:"api_port,omitempty" `
-	CpuThreshold   int32   `json:"cpu_threshold" default:"80" `
-	RewriteTarget  bool    `json:"rewrite_target" default:"false" `
-	NodePort       []int32 `json:"nodePort,omitempty" `
-	DefaultCommand bool    `json:"default_command" `
-	SetAuth        bool    `json:"set_auth" `
-	AuthType       string  `json:"auth_type,omitempty" default:"basic" `
-	HealthPath     string  `json:"health_path" default:"/" `
-	ProbeMode      string  `json:"probe_mode,omitempty" default:"legacy" `
+	MinScale       int32      `json:"min_scale" default:"1"`
+	MaxScale       int32      `json:"max_scale" default:"10"`
+	APIPort        []int      `json:"api_port,omitempty" `
+	CpuThreshold   int32      `json:"cpu_threshold" default:"80" `
+	RewriteTarget  bool       `json:"rewrite_target" default:"false" `
+	NodePort       []int32    `json:"nodePort,omitempty" `
+	DefaultCommand bool       `json:"default_command" `
+	SetAuth        bool       `json:"set_auth" `
+	AuthType       string     `json:"auth_type,omitempty" default:"basic" `
+	HealthPath     string     `json:"health_path" default:"/" `
+	ProbeMode      string     `json:"probe_mode,omitempty" default:"legacy" `
+	Vpa            VpaConfig  `json:"vpa,omitempty"`
+	Keda           KedaConfig `json:"keda,omitempty"`
+}
+
+// Creates a VerticalPodAutoscaler (updateMode "Off") alongside the native HPA, never replacing it.
+type VpaConfig struct {
+	Enabled bool `json:"enabled,omitempty" default:"false"`
+}
+
+// Creates a ScaledObject instead of the native HPA (mutually exclusive, never both at once).
+type KedaConfig struct {
+	Enabled bool            `json:"enabled,omitempty" default:"false"`
+	Cron    KedaCronTrigger `json:"cron,omitempty"`
+}
+
+// Only "cron" is currently supported as a KEDA trigger type.
+type KedaCronTrigger struct {
+	Start           string `json:"start,omitempty"`
+	End             string `json:"end,omitempty"`
+	DesiredReplicas string `json:"desired_replicas,omitempty"`
+	Timezone        string `json:"timezone,omitempty" default:"Etc/UTC"`
 }
 
 // ToPodSpec returns a k8s podSpec from the Service
