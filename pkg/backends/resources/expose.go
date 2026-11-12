@@ -104,7 +104,7 @@ func CreateExpose(service *types.Service, namespace string, kubeClientset kubern
 	isFirstPortDynamic := len(service.Expose.NodePort) > 0 && service.Expose.NodePort[0] == 0
 	err := createDeployment(*service, targetNamespace, kubeClientset, cfg)
 	if err != nil {
-		return fmt.Errorf("error creating deployment for exposed service '%s': %v", service.Name, err)
+		return fmt.Errorf("error creating deployment for exposed service '%s': %w", service.Name, err)
 	}
 
 	ports, err := createService(service, targetNamespace, kubeClientset, cfg)
@@ -452,11 +452,26 @@ func createDeployment(service types.Service, namespace string, kubeClientset kub
 		return err
 	}
 
-	hpa := getHortizontalAutoScaleSpec(service, namespace, cfg)
-	_, err = kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Create(context.TODO(), hpa, metav1.CreateOptions{})
-	if err != nil {
-		return err
+	if cfg.KedaEnable && service.Expose.Keda.Enabled {
+		err = createScaledObject(service, namespace, cfg)
+		if err != nil {
+			return err
+		}
+	} else {
+		hpa := getHortizontalAutoScaleSpec(service, namespace, cfg)
+		_, err = kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Create(context.TODO(), hpa, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
 	}
+
+	if cfg.VpaEnable && service.Expose.Vpa.Enabled {
+		err = createVPA(service, namespace, cfg)
+		if err != nil {
+			return err
+		}
+	}
+
 	if cfg.KueueEnable {
 		err = utils.CheckWorkloadAdmited(service, namespace, cfg, kubeClientset, getDeploymentSpec)
 		if err != nil {
@@ -545,6 +560,28 @@ func getHortizontalAutoScaleSpec(service types.Service, namespace string, cfg *t
 	return hpa
 }
 
+func existsHPA(serviceName string, namespace string, kubeClientset kubernetes.Interface) bool {
+	_, err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Get(context.TODO(), getHPAName(serviceName), metav1.GetOptions{})
+	return err == nil
+}
+
+func createHPA(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	hpa := getHortizontalAutoScaleSpec(service, namespace, cfg)
+	_, err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Create(context.TODO(), hpa, metav1.CreateOptions{})
+	return err
+}
+
+func updateHPA(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	hpa := getHortizontalAutoScaleSpec(service, namespace, cfg)
+	_, err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Update(context.TODO(), hpa, metav1.UpdateOptions{})
+	return err
+}
+
+func deleteHPA(serviceName string, namespace string, kubeClientset kubernetes.Interface) error {
+	err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Delete(context.TODO(), getHPAName(serviceName), metav1.DeleteOptions{})
+	return ignoreNotFound(err)
+}
+
 // Return the Pod spec inside of deployment, ready to create or update
 
 func getPodTemplateSpec(service types.Service, namespace string, cfg *types.Config) v1.PodTemplateSpec {
@@ -631,13 +668,78 @@ func listDeployments(namespace string, kubeClientset kubernetes.Interface, cfg *
 	return deployment, hpa, nil
 }
 
-// Delete Deployment and HPA
-func deleteDeployment(name string, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
-	name_hpa := getHPAName(name)
-	err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Delete(context.TODO(), name_hpa, metav1.DeleteOptions{})
-	if err = ignoreNotFound(err); err != nil {
-		return err
+// Unlike existsScaledObject (keda.go), distinguishes a Forbidden error (returned as-is, so a
+// permissions problem is never mistaken for "nothing to delete") from a missing CRD or a
+// genuine 404 (both treated as absence, since deleting a CRD cascades to all its instances).
+func existsScaledObjectOrError(serviceName string, namespace string) (bool, error) {
+	gatewayClientset, err := gatewayClientsetProvider()
+	if err != nil {
+		return false, err
 	}
+
+	_, err = gatewayClientset.Resource(scaledObjectGVR).Namespace(namespace).Get(context.TODO(), getScaledObjectName(serviceName), metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsForbidden(err) {
+		return false, err
+	}
+	if apierrors.IsNotFound(err) || isMissingKedaAPI(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// VPA equivalent of existsScaledObjectOrError, same four outcomes.
+func existsVPAOrError(serviceName string, namespace string) (bool, error) {
+	gatewayClientset, err := gatewayClientsetProvider()
+	if err != nil {
+		return false, err
+	}
+
+	_, err = gatewayClientset.Resource(vpaGVR).Namespace(namespace).Get(context.TODO(), getVPAName(serviceName), metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsForbidden(err) {
+		return false, err
+	}
+	if apierrors.IsNotFound(err) || isMissingVpaAPI(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// Deletes HPA, ScaledObject, VPA+checkpoint and finally the Deployment, in that order. What to
+// delete is decided from what actually exists in the cluster, not from cfg/FDL (deleteDeployment
+// only gets the service name, and the config may have changed since the resource was created).
+func deleteDeployment(name string, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	if existsHPA(name, namespace, kubeClientset) {
+		if err := deleteHPA(name, namespace, kubeClientset); err != nil {
+			return fmt.Errorf("error deleting HPA for service %q: %w", name, err)
+		}
+	}
+
+	scaledObjectExists, err := existsScaledObjectOrError(name, namespace)
+	if err != nil {
+		return fmt.Errorf("error checking ScaledObject existence for service %q: %w", name, err)
+	}
+	if scaledObjectExists {
+		if err := deleteScaledObject(getScaledObjectName(name), namespace); err != nil {
+			return fmt.Errorf("error deleting ScaledObject for service %q: %w", name, err)
+		}
+	}
+
+	vpaExists, err := existsVPAOrError(name, namespace)
+	if err != nil {
+		return fmt.Errorf("error checking VPA existence for service %q: %w", name, err)
+	}
+	if vpaExists {
+		if err := deleteVPA(getVPAName(name), namespace); err != nil {
+			return fmt.Errorf("error deleting VPA for service %q: %w", name, err)
+		}
+	}
+
 	deployment := GetDeploymentName(name)
 	err = kubeClientset.AppsV1().Deployments(namespace).Delete(context.TODO(), deployment, metav1.DeleteOptions{})
 	if err = ignoreNotFound(err); err != nil {
@@ -647,6 +749,102 @@ func deleteDeployment(name string, namespace string, kubeClientset kubernetes.In
 }
 
 ///Update Deployment and HPA
+
+// Rollback is best-effort: a failure there is logged but never replaces the original error.
+func transitionHPAToKeda(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	hpaSpec := getHortizontalAutoScaleSpec(service, namespace, cfg)
+
+	if err := deleteHPA(service.Name, namespace, kubeClientset); err != nil {
+		return err
+	}
+
+	if err := createScaledObject(service, namespace, cfg); err != nil {
+		if _, rollbackErr := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Create(context.TODO(), hpaSpec, metav1.CreateOptions{}); rollbackErr != nil {
+			ExposeLogger.Printf("rollback failed: could not recreate HPA for service '%s' after ScaledObject creation failure: %v", service.Name, rollbackErr)
+		}
+		return fmt.Errorf("error creating ScaledObject for service '%s', rolled back to HPA: %w", service.Name, err)
+	}
+
+	return nil
+}
+
+// Rollback is best-effort: a failure there is logged but never replaces the original error.
+func transitionKedaToHPA(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	hpaSpec := getHortizontalAutoScaleSpec(service, namespace, cfg)
+
+	if err := deleteScaledObject(getScaledObjectName(service.Name), namespace); err != nil {
+		return err
+	}
+
+	if _, err := kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Create(context.TODO(), hpaSpec, metav1.CreateOptions{}); err != nil {
+		if rollbackErr := createScaledObject(service, namespace, cfg); rollbackErr != nil {
+			ExposeLogger.Printf("rollback failed: could not recreate ScaledObject for service '%s' after HPA creation failure: %v", service.Name, rollbackErr)
+		}
+		return fmt.Errorf("error creating HPA for service '%s', rolled back to ScaledObject: %w", service.Name, err)
+	}
+
+	return nil
+}
+
+// Drives the cluster to whichever mechanism (HPA or KEDA) is desired, from whatever currently
+// exists - the 8 cases below cover every combination of desired mechanism x HPA exists x
+// ScaledObject exists.
+func reconcileHorizontalAutoscaler(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
+	kedaDesired := cfg.KedaEnable && service.Expose.Keda.Enabled
+	hpaExists := existsHPA(service.Name, namespace, kubeClientset)
+	scaledObjectExists := existsScaledObject(service.Name, namespace)
+
+	switch {
+	case kedaDesired && hpaExists && scaledObjectExists:
+		// Inconsistent state: remove the unwanted HPA, update the existing ScaledObject.
+		if err := deleteHPA(service.Name, namespace, kubeClientset); err != nil {
+			return err
+		}
+		return updateScaledObject(service, namespace, cfg)
+
+	case kedaDesired && hpaExists && !scaledObjectExists:
+		return transitionHPAToKeda(service, namespace, kubeClientset, cfg)
+
+	case kedaDesired && !hpaExists && scaledObjectExists:
+		return updateScaledObject(service, namespace, cfg)
+
+	case kedaDesired && !hpaExists && !scaledObjectExists:
+		return createScaledObject(service, namespace, cfg)
+
+	case !kedaDesired && hpaExists && scaledObjectExists:
+		// Inconsistent state: remove the unwanted ScaledObject, update the existing HPA.
+		if err := deleteScaledObject(getScaledObjectName(service.Name), namespace); err != nil {
+			return err
+		}
+		return updateHPA(service, namespace, kubeClientset, cfg)
+
+	case !kedaDesired && hpaExists && !scaledObjectExists:
+		return updateHPA(service, namespace, kubeClientset, cfg)
+
+	case !kedaDesired && !hpaExists && scaledObjectExists:
+		return transitionKedaToHPA(service, namespace, kubeClientset, cfg)
+
+	default: // neither exists (e.g. deleted manually outside OSCAR)
+		return createHPA(service, namespace, kubeClientset, cfg)
+	}
+}
+
+// VPA is independent of the HPA/KEDA mechanism and never part of its rollback.
+func reconcileVPA(service types.Service, namespace string, cfg *types.Config) error {
+	vpaDesired := cfg.VpaEnable && service.Expose.Vpa.Enabled
+	vpaExists := existsVPA(service.Name, namespace)
+
+	switch {
+	case vpaDesired && vpaExists:
+		return updateVPA(service, namespace, cfg)
+	case vpaDesired && !vpaExists:
+		return createVPA(service, namespace, cfg)
+	case !vpaDesired && vpaExists:
+		return deleteVPA(getVPAName(service.Name), namespace)
+	default: // !vpaDesired && !vpaExists
+		return nil
+	}
+}
 
 func updateDeployment(service types.Service, namespace string, kubeClientset kubernetes.Interface, cfg *types.Config) error {
 	_, err := kubeClientset.AppsV1().Deployments(namespace).Get(context.TODO(), GetDeploymentName(service.Name), metav1.GetOptions{})
@@ -671,16 +869,11 @@ func updateDeployment(service types.Service, namespace string, kubeClientset kub
 		return err
 	}
 
-	_, err = kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Get(context.TODO(), getHPAName(service.Name), metav1.GetOptions{})
-	if err != nil {
+	if err := reconcileHorizontalAutoscaler(service, namespace, kubeClientset, cfg); err != nil {
 		return err
 	}
-	hpa := getHortizontalAutoScaleSpec(service, namespace, cfg)
-	_, err = kubeClientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).Update(context.TODO(), hpa, metav1.UpdateOptions{})
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return reconcileVPA(service, namespace, cfg)
 }
 
 /////////// Service
